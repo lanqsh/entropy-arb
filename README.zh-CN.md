@@ -159,7 +159,8 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 
 - **Entropy / tradexyz（Hyperliquid）** —— 在
   <https://app.hyperliquid.xyz/API> 创建 API（agent）钱包。`HL_PRIVATE_KEY`
-  填 **agent 钱包私钥**，`HL_ACCOUNT_ADDRESS` 填主账户地址。当
+  填 **agent 钱包私钥**；`HL_ACCOUNT_ADDRESS` 可以填主账户地址，也可以填
+  API agent 地址。程序会通过 `userRole` 自动解析 agent 关联的主账户地址。当
   `--hedge tradexyz` 时两条腿默认共用该账户（内部自动共享 nonce 序列）；
   如需分开，设置 `HL_PRIVATE_KEY_XYZ` / `HL_ACCOUNT_ADDRESS_XYZ`。注意给
   所交易的各 dex 分别充入保证金。

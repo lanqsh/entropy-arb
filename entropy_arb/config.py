@@ -256,7 +256,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                 symbol: str, hedge_venue: str) -> Config:
     load_dotenv(env_file)
     try:
-        with open(config_file) as fh:
+        with open(config_file, encoding="utf-8") as fh:
             raw = yaml.safe_load(fh) or {}
     except FileNotFoundError:
         raise ConfigError(

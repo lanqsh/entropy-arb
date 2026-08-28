@@ -81,6 +81,7 @@ class HLVenue:
         self.orders_per_min = conf.orders_per_min
         self.last_traded_ts = 0.0
         self.account: Optional[HLAccount] = None
+        self._resolved_query_address: Optional[str] = None
         self.coin = ""
         self.asset_id = -1
         self.size_decimals = 0
@@ -285,10 +286,29 @@ class HLVenue:
     # -------------------------------------------------------------- accounts
 
     def _query_address(self):
+        if self._resolved_query_address is not None:
+            return self._resolved_query_address
         if self.account is not None:
             return self.account.query_address
         c = self.conf.hl_creds
         return c.account_address.lower() if c and c.account_address else None
+
+    async def resolve_query_address(self) -> str:
+        """Resolve an API agent wallet to its linked master account."""
+        address = self._query_address()
+        if address is None:
+            raise RuntimeError(f"[{self.name}] missing account address")
+        role = await self._info({"type": "userRole", "user": address})
+        if role.get("role") == "agent":
+            master = ((role.get("data") or {}).get("user") or "").lower()
+            if not master:
+                raise RuntimeError(
+                    f"[{self.name}] userRole returned an agent without a "
+                    "linked account")
+            self._resolved_query_address = master
+            log.info("[%s] API agent %s resolved to master account %s",
+                     self.name, address, master)
+        return self._query_address()
 
     async def fetch_equity(self):
         """Unified account equity via the portfolio endpoint — the same
@@ -299,6 +319,7 @@ class HLVenue:
         addr = self._query_address()
         if addr is None:
             return None
+        portfolio_equity = None
         if self.include_core_equity:
             try:
                 p = await self._info({"type": "portfolio", "user": addr})
@@ -306,7 +327,8 @@ class HLVenue:
                     if period == "day":
                         hist = d.get("accountValueHistory") or []
                         if hist:
-                            return float(hist[-1][1]), None
+                            portfolio_equity = float(hist[-1][1])
+                            break
             except Exception as e:
                 log.debug("[%s] portfolio fetch failed, falling back: %r",
                           self.name, e)
@@ -318,7 +340,19 @@ class HLVenue:
             ms = st.get("marginSummary") or {}
             eq += float(ms.get("accountValue") or 0.0)
             fr += float(st.get("withdrawable") or 0.0)
-        return eq, fr
+        spot_free = 0.0
+        try:
+            spot = await self._info({"type": "spotClearinghouseState",
+                                     "user": addr})
+            for balance in spot.get("balances") or []:
+                if balance.get("coin") == "USDC":
+                    spot_free = max(
+                        spot_free,
+                        float(balance.get("total") or 0.0)
+                        - float(balance.get("hold") or 0.0))
+        except Exception as e:
+            log.debug("[%s] spot balance fetch failed: %r", self.name, e)
+        return (portfolio_equity if portfolio_equity is not None else eq), max(fr, spot_free)
 
     async def fetch_position(self) -> float:
         addr = self._query_address()

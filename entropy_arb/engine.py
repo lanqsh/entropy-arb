@@ -154,6 +154,10 @@ class Engine:
                     "请用 --record-only")
             self.entropy.init_signer()
             self.hedge.init_signer()
+            hl_venues = [v for v in (self.entropy, self.hedge)
+                         if v.kind == "hl"]
+            await asyncio.gather(*(v.resolve_query_address()
+                                   for v in hl_venues))
             if self.hedge.kind == "hl":
                 self.entropy.share_nonces_with(self.hedge)
         if (self.hedge.kind == "hl"
@@ -409,9 +413,9 @@ class Engine:
     # ------------------------------------------------------------- execution
 
     async def _execute(self, buy, sell, plan: ArbPlan) -> bool:
-        """Send both legs and settle the fills. Both venue locks are held by
-        the caller. Returns True when an outcome is unresolved and the caller
-        must escalate to reconcile."""
+        """Send both legs sequentially: Entropy first, then hedge. Both venue
+        locks are held by the caller. Returns True when an outcome is
+        unresolved and the caller must escalate to reconcile."""
         if self.halted:
             return False
         cfg = self.cfg
@@ -426,19 +430,80 @@ class Engine:
         slip = cfg.leg_slippage_bps / 1e4
         buy_bound = buy.px_round(plan.buy_limit * (1 + slip), round_up=False)
         sell_bound = sell.px_round(plan.sell_limit * (1 - slip), round_up=True)
-        self._record_send(buy)
-        self._record_send(sell)
-        res = await asyncio.gather(
-            buy.send_taker(is_buy=True, qty=plan.qty, limit_px=buy_bound),
-            sell.send_taker(is_buy=False, qty=plan.qty, limit_px=sell_bound),
-            return_exceptions=True)
-        binfo, sinfo = (r if isinstance(r, dict) else
-                        {"status": "send-failed", "filled_base": 0.0,
-                         "avg_px": None, "err": repr(r), "unresolved": False}
-                        for r in res)
-        for v, info, side in ((buy, binfo, "buy"), (sell, sinfo, "sell")):
-            if info.get("err"):
-                log.error("[%s] %s leg: %s", v.name, side, info["err"])
+
+        # Determine which venue is Entropy
+        if buy.key == "entropy":
+            entropy_venue, hedge_venue = buy, sell
+            entropy_side_is_buy = True
+            entropy_bound, hedge_bound = buy_bound, sell_bound
+        else:
+            entropy_venue, hedge_venue = sell, buy
+            entropy_side_is_buy = False
+            entropy_bound, hedge_bound = sell_bound, buy_bound
+
+        # Step 1: Execute Entropy order first
+        self._record_send(entropy_venue)
+        try:
+            entropy_info = await entropy_venue.send_taker(
+                is_buy=entropy_side_is_buy, qty=plan.qty, limit_px=entropy_bound)
+        except Exception as e:
+            entropy_info = {"status": "send-failed", "filled_base": 0.0,
+                           "avg_px": None, "err": repr(e), "unresolved": False}
+
+        entropy_fill = entropy_info["filled_base"]
+        if entropy_info.get("err"):
+            log.error("[%s] entropy leg: %s", entropy_venue.name,
+                     entropy_info["err"])
+
+        # Step 2: Determine hedge quantity based on Entropy fill
+        if entropy_fill <= 0:
+            log.warning("[ENTROPY REJECTED] no fill on entropy — skipping "
+                       "hedge leg to avoid directional exposure")
+            hedge_qty = 0.0
+        elif entropy_fill < plan.qty:
+            hedge_qty = floor_step(entropy_fill, self._step)
+            log.info("[ENTROPY PARTIAL] filled %.6g/%.6g — adjusting hedge "
+                    "to %.6g", entropy_fill, plan.qty, hedge_qty)
+        else:
+            hedge_qty = plan.qty
+
+        # Step 3: Execute hedge order if feasible
+        if hedge_qty >= hedge_venue.min_base:
+            hedge_notional = hedge_qty * hedge_bound
+            min_required = max(cfg.min_order_notional, hedge_venue.min_quote)
+            if hedge_notional >= min_required:
+                self._record_send(hedge_venue)
+                try:
+                    hedge_info = await hedge_venue.send_taker(
+                        is_buy=(not entropy_side_is_buy), qty=hedge_qty,
+                        limit_px=hedge_bound)
+                except Exception as e:
+                    hedge_info = {"status": "send-failed", "filled_base": 0.0,
+                                 "avg_px": None, "err": repr(e),
+                                 "unresolved": False}
+                if hedge_info.get("err"):
+                    log.error("[%s] hedge leg: %s", hedge_venue.name,
+                             hedge_info["err"])
+            else:
+                log.warning("[HEDGE SKIP] entropy fill %.6g creates notional "
+                           "$%.2f < min $%.2f — carrying exposure (auto-hedge "
+                           "will retry)", entropy_fill, hedge_notional,
+                           min_required)
+                hedge_info = {"status": "skipped-min-notional",
+                             "filled_base": 0.0, "avg_px": None, "err": None,
+                             "unresolved": False}
+        else:
+            log.warning("[HEDGE SKIP] entropy fill %.6g below hedge min_base "
+                       "%.6g — carrying exposure", entropy_fill,
+                       hedge_venue.min_base)
+            hedge_info = {"status": "skipped-min-base", "filled_base": 0.0,
+                         "avg_px": None, "err": None, "unresolved": False}
+
+        # Map results back to buy/sell for unified processing
+        if buy.key == "entropy":
+            binfo, sinfo = entropy_info, hedge_info
+        else:
+            binfo, sinfo = hedge_info, entropy_info
         bfill = binfo["filled_base"]
         sfill = sinfo["filled_base"]
         buy.position += bfill
@@ -508,8 +573,14 @@ class Engine:
 
     async def _maybe_hedge(self) -> None:
         net = sum(v.position for v in self.venues.values())
+        positions = {v.name: v.position for v in self.venues.values()}
+        log.debug(f"[HEDGE CHECK] net={net:+.6f} tolerance={self.cfg.net_tolerance_base:.6f} "
+                  f"positions={positions}")
         if abs(net) > self.cfg.net_tolerance_base:
+            log.info(f"[HEDGE TRIGGER] net={net:+.6f} exceeds tolerance, starting hedge")
             await self._hedge(net)
+        else:
+            log.debug(f"[HEDGE SKIP] net={net:+.6f} within tolerance")
 
     async def _hedge(self, net: float) -> None:
         """Reduce the venue that carries the imbalance back toward net zero
@@ -518,36 +589,47 @@ class Engine:
         is_sell = net > 0
         sgn = 1.0 if net > 0 else -1.0
         slip = cfg.hedge_slippage_bps / 1e4
+
         for v in sorted(self.venues.values(),
                         key=lambda x: (self._venue_limited(x), -x.position * sgn)):
+
             if v.position * sgn <= 0:
                 continue
             if v.key in self._venue_down \
                     or not v.book.is_fresh(cfg.staleness_sec):
-                continue  # unreachable or blind: cannot hedge here
+                log.warning(f"[HEDGE SKIP] {v.name}: venue down or book stale")
+                continue
             lk = self._vlock(v.key)
             if lk.locked():
+                log.debug(f"[HEDGE SKIP] {v.name}: lock held")
                 continue
             qty = floor_step(min(abs(net), abs(v.position)), self._step)
             if qty < v.min_base:
+                log.warning(f"[HEDGE SKIP] {v.name}: qty={qty:.6f} < min_base={v.min_base:.6f}")
                 continue
             ref = v.book.best_bid() if is_sell else v.book.best_ask()
             if ref is None:
+                log.warning(f"[HEDGE SKIP] {v.name}: no {'bid' if is_sell else 'ask'} in book")
                 continue
             limit = v.px_round(ref * (1 - slip), False) if is_sell \
                 else v.px_round(ref * (1 + slip), True)
-            if qty * limit < max(cfg.min_order_notional, v.min_quote):
+            notional = qty * limit
+            min_required = max(cfg.min_order_notional, v.min_quote)
+            if notional < min_required:
+                log.warning(f"[HEDGE SKIP] {v.name}: notional=${notional:.2f} < min=${min_required:.2f} "
+                           f"(qty={qty:.6f} @ {limit:.2f})")
                 continue
-            await lk.acquire()  # verified free, no awaits since: fast path
+
+            await lk.acquire()
             try:
                 log.warning("[HEDGE] net %+.6g — %s %.6g on %s @%.6g",
                             net, "SELL" if is_sell else "BUY", qty, v.name, limit)
                 self.hedges += 1
-                self._record_send(v)  # counts toward the budget, never blocked
+                self._record_send(v)
                 info = await v.send_taker(is_buy=not is_sell, qty=qty,
                                           limit_px=limit, reduce_only=True)
                 if info.get("err") or info.get("unresolved"):
-                    log.error("[HEDGE] %s: %s", v.name,
+                    log.error("[HEDGE FAILED] %s: %s", v.name,
                               info.get("err") or "unresolved")
                     if str(info.get("err", "")).startswith("RATE_LIMITED"):
                         self._mark_limited(v)
@@ -561,21 +643,24 @@ class Engine:
                         v.cash += fill * px * (1 - fee) if is_sell \
                             else -fill * px * (1 + fee)
                         v.volume_usd += fill * px
-                    log.info("[HEDGE SETTLED] %s %s %.6g/%.6g",
-                             v.name, info["status"], fill, qty)
+                    log.info("[HEDGE SETTLED] %s %s %.6g/%.6g (position now %+.6g)",
+                             v.name, info["status"], fill, qty, v.position)
                 v.last_traded_ts = time.time()
             finally:
                 lk.release()
             return
-        log.warning("[HEDGE] net %+.6g below hedgeable minimum — carrying "
-                    "(next reconcile retries)", net)
+        positions_detail = {v.name: f"{v.position:+.6f}" for v in self.venues.values()}
+        log.warning(f"[HEDGE FAILED] net={net:+.6g} below hedgeable minimum — carrying "
+                    f"(positions={positions_detail}, next reconcile retries)")
 
     # --------------------------------------------------- reconcile / status
 
     # Lighter's REST account state lags its ws settlements; overwriting a
     # venue that traded seconds ago "restores" stale positions and triggers
     # phantom hedge oscillations. Grace-guard + venue lock prevent that.
-    RECONCILE_GRACE_SEC = 5.0
+    # Entropy (Hyperliquid L1) can also take 15-30s for on-chain confirmation,
+    # so we use a conservative grace period to avoid adopting stale chain state.
+    RECONCILE_GRACE_SEC = 60.0
 
     async def _reconcile_positions(self, hedge: bool,
                                    strict: bool = False) -> None:
@@ -597,12 +682,16 @@ class Engine:
             if isinstance(r, BaseException):
                 raise r  # strict startup: fail loudly
         if hedge:
+            log.debug("[RECONCILE] triggering hedge check after position sync")
             await self._maybe_hedge()
 
     async def _reconcile_venue(self, v, strict: bool) -> None:
         async with self._vlock(v.key):
             now = time.time()
-            if now - v.last_traded_ts <= self.RECONCILE_GRACE_SEC:
+            time_since_trade = now - v.last_traded_ts
+            if time_since_trade <= self.RECONCILE_GRACE_SEC:
+                log.debug("[%s] reconcile skipped: traded %.1fs ago (grace %.0fs)",
+                          v.name, time_since_trade, self.RECONCILE_GRACE_SEC)
                 return  # traded while waiting for the lock
             try:
                 r = await v.fetch_position()
@@ -637,11 +726,19 @@ class Engine:
             if abs(delta) > 1e-12:
                 if abs(delta) > self.cfg.net_tolerance_base:
                     log.warning("[%s] reconcile: chain %+.6g vs local %+.6g "
-                                "— adopting chain", v.name, r, v.position)
+                                "(delta %+.6g, %.1fs since trade) — adopting chain",
+                                v.name, r, v.position, delta, time_since_trade)
+                else:
+                    log.info("[%s] reconcile: chain %+.6g vs local %+.6g "
+                             "(delta %+.6g within tolerance) — adopting chain",
+                             v.name, r, v.position, delta)
                 mid = v.book.mid()
                 if mid is not None:
                     v.cash -= delta * mid
                 v.position = r
+            else:
+                log.debug("[%s] reconcile: positions match (chain=%+.6g local=%+.6g)",
+                          v.name, r, v.position)
 
     async def _reconcile_loop(self) -> None:
         while not self.stop.is_set():
