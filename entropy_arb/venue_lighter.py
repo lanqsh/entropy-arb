@@ -242,14 +242,14 @@ class LighterVenue:
         """Keep the order-path HTTPS connections warm (a cold TLS handshake
         adds 10-15ms to the first order after an idle spell)."""
         try:
-            await self._get("/api/v1/status")
+            await self._get("/api/v1/orderBooks")
         except Exception as e:
             log.debug("[%s] keepalive ping failed: %r", self.name, e)
         if self.signer is None:
             return
         try:
             sess = self.signer.api_client.rest_client.pool_manager
-            async with sess.get(self.profile.api_url + "/api/v1/status",
+            async with sess.get(self.profile.api_url + "/api/v1/orderBooks",
                                 timeout=aiohttp.ClientTimeout(total=5)) as r:
                 await r.read()
         except Exception as e:
